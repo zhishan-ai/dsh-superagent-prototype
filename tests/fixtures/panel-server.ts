@@ -293,6 +293,7 @@ const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET assistant/:room': { answer: ({ params }) => ({ room: params.room, partners: [...partners], groups: [team], cards: [] }) },
+  'GET assistant/:room/files/:id': { answer: () => ({ name: 'sample.txt', data: '' }) },
   'POST assistant': { answer: () => [] },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },

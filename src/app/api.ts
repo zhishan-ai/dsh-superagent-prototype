@@ -19,6 +19,7 @@ type Delivery = 'injected' | 'pending'
 
 export interface Api {
   'GET assistant/:room': { response: import('../assistant/contracts.ts').AssistantView }
+  'GET assistant/:room/files/:id': { response: { name: string; data: string } }
   'POST assistant': { response: unknown }
   'GET state': { response: StateView }
   'GET overview': { response: OverviewView }

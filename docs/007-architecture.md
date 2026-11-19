@@ -377,6 +377,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/assistant/contracts.ts` | Partner and group rosters, room views, conversation cards and the optional DingTalk workspace service contract |
 | `src/assistant/planner.ts` | Host model routing for room-scoped roles, group work plans, handoff inputs and personal-work intents |
 | `src/assistant/desk.ts` | Durable partners, conversations, group work admission, confirmed deliveries, meetings and scoped reply cursors |
+| `src/assistant/files.ts` | Bounded uploads to DSH attachment storage, message-scoped downloads and model-readable text excerpts |
 | `src/assistant/group-work.ts` | Persistent group plans and steps, validated dependencies, result handoffs and bounded concurrent execution |
 | `src/client/assistant.css` | Partner portraits and responsive conversation layout |
 | `src/client/assistant.tsx` | Personal assistant panel, member mentions, inline group work progress and group-message review |
@@ -450,6 +451,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/assistant.spec.ts` | Room-scoped routing, group work and handoffs, recovery, personal workflow, confirmation and reply isolation |
+| `tests/assistant-files.spec.ts` | Attachment admission, trusted storage references, model context, download scope and replay |
+| `tests/assistant-lifecycle.spec.ts` | Partner and group edits, deletion and restoration, historical attribution and in-flight work guards |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
 `tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.

@@ -29,6 +29,7 @@ import { decisionList, search, threadDetail, threadList } from './views/threads.
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 
 import { AssistantInputError, type AssistantDesk } from '../assistant/desk.ts'
+import { fileRequestBytes } from '../assistant/files.ts'
 
 export interface HttpHost {
   readonly assistant: AssistantDesk
@@ -157,7 +158,8 @@ function routes(runtime: HttpHost): Routes {
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
     'GET assistant/:room': ({ params }) => runtime.assistant.conversation(params.room),
-    'POST assistant': async ({ body }) => runtime.assistant.execute(await body()),
+    'GET assistant/:room/files/:id': ({ params }) => runtime.assistant.download(params.room, params.id),
+    'POST assistant': async ({ body }) => runtime.assistant.execute(await body(fileRequestBytes)),
     'GET state': () => stateView(runtime),
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
       executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),

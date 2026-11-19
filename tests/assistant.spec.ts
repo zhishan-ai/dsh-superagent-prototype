@@ -78,6 +78,26 @@ it('routes ordinary language through the host model and validates its action pla
   expect(stream).toHaveBeenCalledWith(expect.objectContaining({provider:'p',model:'m',system:expect.stringContaining('当前会话：助手群')}))
 })
 
+it('binds a worker result to its assigned partner and asks only for the current delivery', async () => {
+  const stream = vi.fn(async function* (_options: { system: string; messages: unknown }) {
+    yield { type: 'text-delta', text: JSON.stringify({ reply: '活动物料是琥珀色印花夹。' }) }
+  })
+  const route = planner({ sessionController: { modelCatalog: async () => ({ default: { provider: 'p', model: 'm' } }) },
+    llm: { stream } } as never, new AbortController().signal)
+  const context = { name: '换书会', partners: [...partners], target: 'teal',
+    files: [{ name: '清单.csv', bytes: 20, readable: true, excerpt: '物料,琥珀色印花夹' }],
+    workStep: { title: '整理物料', instructions: '从清单中找出物料', inputs: [] } }
+  await expect(route('team', '[]', '请安排两步群内协作', context)).resolves.toEqual({
+    bot: 'teal', reply: '活动物料是琥珀色印花夹。', actions: [],
+  })
+  expect(stream.mock.calls[0]?.[0].system).toContain('消息与跟进')
+  expect(JSON.stringify(stream.mock.calls[0]?.[0].messages)).toContain('琥珀色印花夹')
+  stream.mockImplementationOnce(async function* () {
+    yield { type: 'text-delta', text: JSON.stringify({ reply: '执行了其他操作', actions: [{ kind: 'draft' }] }) }
+  })
+  await expect(route('team', '[]', '请安排两步群内协作', context)).rejects.toThrow('解析')
+})
+
 it('restores added partners, selected group members, and their messages from the existing SQLite store', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-assistant-'))
   const path = join(directory, 'orchestrator.sqlite')

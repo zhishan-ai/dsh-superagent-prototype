@@ -15,6 +15,18 @@ export interface AssistantView {
   groups: Group[]
   cards: Card[]
   work?: GroupWork[]
+  deleted?: { kind: 'partner' | 'group'; id: string; name: string }[]
+  removedPartners?: Partner[]
+  fileUploads?: boolean
+}
+
+export const assistantLimits = { fileCount: 4, fileBytes: 512 * 1024, messageFileBytes: 1024 * 1024 } as const
+export interface AssistantFile {
+  id: string
+  name: string
+  bytes: number
+  readable: boolean
+  truncated?: boolean
 }
 
 export interface GroupWorkStep {
@@ -55,4 +67,5 @@ export interface Workspace {
 }
 export interface Card {
   id: string; room: string; author: string; kind: string; title: string; body: string; state: string; account: string; target: string
+  files?: AssistantFile[]
 }

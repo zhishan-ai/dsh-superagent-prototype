@@ -167,7 +167,7 @@ export class Runtime extends Service implements SourceHost {
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
-      this.assistant = new AssistantDesk(store.db, () => ctx.get('dingtalkWorkspace'), planner(ctx,this.lifetime))
+      this.assistant = new AssistantDesk(store.db, () => ctx.get('dingtalkWorkspace'), planner(ctx,this.lifetime), () => ctx.get('attachments'))
       this.ready = this.initialize()
     } catch (error) {
       // Release the database and state lock if initialization fails so an in-process restart can reacquire them.

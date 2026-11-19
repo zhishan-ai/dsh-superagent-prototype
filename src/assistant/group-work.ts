@@ -39,6 +39,11 @@ interface StepRow {
 
 type RunStep = (room: string, requestId: string, step: WorkStep, inputs: WorkInput[]) => Promise<string>
 const parallelSteps = 2
+const dependenciesDone = `NOT EXISTS (
+  SELECT 1 FROM json_each(step.depends_on) AS dependency
+  LEFT JOIN assistant_group_work_step AS source ON source.work_id=step.work_id AND source.id=dependency.value
+  WHERE source.state IS NOT 'done'
+)`
 
 function orderedSteps(steps: WorkStep[]): WorkStep[] {
   const remaining = new Map(steps.map(step => [step.id, step]))
@@ -130,16 +135,21 @@ export class GroupWorkQueue {
     return result.changes > 0
   }
 
+  hasActive(room: string, partners?: string[]): boolean {
+    const scope = partners ? JSON.stringify(partners) : null
+    return !!this.db.prepare(`SELECT 1 FROM assistant_group_work AS work WHERE room=?
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM assistant_group_work_step AS affected
+        WHERE affected.work_id=work.id AND affected.state<>'done' AND affected.partner IN (SELECT value FROM json_each(?))))
+      AND EXISTS (SELECT 1 FROM assistant_group_work_step AS step WHERE step.work_id=work.id
+        AND (step.state='running' OR (step.state='waiting' AND ${dependenciesDone}))) LIMIT 1`).get(room, scope, scope)
+  }
+
   resume(): void {
     const slots = parallelSteps - this.running.size
     if (this.closing || slots <= 0) return
     const next = this.db.prepare(`SELECT step.*,work.room FROM assistant_group_work_step AS step
       JOIN assistant_group_work AS work ON work.id=step.work_id
-      WHERE step.state='waiting' AND NOT EXISTS (
-        SELECT 1 FROM json_each(step.depends_on) AS dependency
-        LEFT JOIN assistant_group_work_step AS source ON source.work_id=step.work_id AND source.id=dependency.value
-        WHERE source.state IS NOT 'done'
-      ) ORDER BY work.rowid, step.rowid LIMIT ?`)
+      WHERE step.state='waiting' AND ${dependenciesDone} ORDER BY work.rowid, step.rowid LIMIT ?`)
       .all(slots) as unknown as (StepRow & { room: string })[]
     const claim = this.db.prepare("UPDATE assistant_group_work_step SET state='running' WHERE work_id=? AND id=? AND state='waiting'")
     for (const step of next) {

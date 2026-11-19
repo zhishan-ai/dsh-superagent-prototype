@@ -1,7 +1,9 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { randomUUID, createHash } from 'node:crypto'
 import { z } from 'zod'
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { partners, team, type AssistantView, type Card, type Group, type Identity, type Partner, type Workspace } from './contracts.ts'
+import { fileContext, fileSignature, fileView, readDownload, storeFiles, uploadFiles, type StoredFile } from './files.ts'
 import { GroupWorkQueue, validateWork, type WorkInput, type WorkStep } from './group-work.ts'
 import { planSchema, type Action, type Planner } from './planner.ts'
 
@@ -10,12 +12,22 @@ const textInput = z.string().trim().min(1).max(8000)
 const partnerName = z.string().trim().min(1).max(16)
   .refine(name => !/[@＠\r\n\t]/.test(name), '伙伴名字不能包含 @ 或换行')
   .transform(name => name.normalize('NFC'))
+const partnerProfile = { name: partnerName, role: z.string().trim().min(1).max(80) }
+const groupName = z.string().trim().min(1).max(32)
+const memberIds = z.array(roomId).refine(ids => new Set(ids).size === ids.length, '请勿重复选择伙伴')
+const roomLifecycle = { id: roomId, room: roomId.optional() }
 const nameKey = (name: string) => name.normalize('NFC').toLowerCase()
 export const command = z.discriminatedUnion('op', [
-  z.object({ op: z.literal('message'), room: roomId, id: z.uuid(), text: textInput, mention: roomId.optional() }),
-  z.object({ op: z.literal('create-partner'), id: z.uuid().optional(), name: partnerName, role: z.string().trim().min(1).max(80) }),
-  z.object({ op: z.literal('create-group'), id: z.uuid().optional(), name: z.string().trim().min(1).max(32),
-    members: z.array(roomId).min(2, '请选择至少两位伙伴').refine(ids => new Set(ids).size === ids.length, '请勿重复选择伙伴') }),
+  z.object({ op: z.literal('message'), room: roomId, id: z.uuid(), text: z.string().trim().max(8000),
+    mention: roomId.optional(), files: uploadFiles.default([]) }),
+  z.object({ op: z.literal('create-partner'), id: z.uuid().optional(), ...partnerProfile }),
+  z.object({ op: z.literal('create-group'), id: z.uuid().optional(), name: groupName,
+    members: memberIds.refine(ids => ids.length >= 2, '请选择至少两位伙伴') }),
+  z.object({ op: z.literal('update-partner'), id: roomId, ...partnerProfile }),
+  z.object({ op: z.literal('update-group'), id: roomId, name: groupName, members: memberIds }),
+  z.object({ op: z.literal('delete-partner'), ...roomLifecycle }),
+  z.object({ op: z.literal('delete-group'), ...roomLifecycle }),
+  z.object({ op: z.literal('restore-room'), ...roomLifecycle }),
   z.object({ op: z.literal('retry'), room: roomId, id: z.string() }),
   z.object({ op: z.literal('retry-work'), room: roomId, id: z.uuid() }),
   z.object({ op: z.literal('card'), room: roomId, id: z.string(), action: z.enum(['confirm','edit','cancel','stop']), previous: z.string().max(8000), body: textInput.optional() }),
@@ -23,10 +35,16 @@ export const command = z.discriminatedUnion('op', [
   z.object({ op: z.literal('connection') }),
 ])
 type Command = z.infer<typeof command>
-interface Meta { parent?: string; mention?: string | null; receipt?: string; action?: Action; profile?: string; group?: Identity; person?: Identity; since?: string; until?: string; token?: string }
+interface Meta { parent?: string; mention?: string | null; receipt?: string; action?: Action; profile?: string; group?: Identity; person?: Identity; since?: string; until?: string; token?: string; files?: StoredFile[]; uploadSignature?: string }
 interface Row extends Card { meta: string }
 interface GroupRow extends Omit<Group, 'members'> { members: string }
-interface Roster { partners: Partner[]; groups: Group[] }
+interface Roster {
+  partners: Partner[]
+  groups: Group[]
+  removedPartners: Partner[]
+  deleted: NonNullable<AssistantView['deleted']>
+  memberLinks: Map<string, string[]>
+}
 
 /** Invalid assistant input that the panel can present to the user. */
 export class AssistantInputError extends Error {
@@ -69,9 +87,13 @@ export class AssistantDesk {
   private readonly groupWork: GroupWorkQueue
   private readonly work = new Set<Promise<unknown>>()
   private readonly busy = new Set<string>()
+  private readonly admitting = new Set<string>()
+  private readonly pendingUploads = new Set<string>()
+  private readonly confirming = new Map<string, Row>()
   private polling = false
   private closing = false
-  constructor(private db: DatabaseSync, private provider: () => Workspace | undefined, private plan: Planner) {
+  constructor(private db: DatabaseSync, private provider: () => Workspace | undefined, private plan: Planner,
+    private attachmentStore: () => Pick<AttachmentStore, 'saveFile' | 'readFileStream'> | undefined = () => undefined) {
     db.exec(`CREATE TABLE IF NOT EXISTS assistant_card (
       id TEXT PRIMARY KEY, room TEXT NOT NULL, author TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
       title TEXT NOT NULL, body TEXT NOT NULL, account TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '{}');
@@ -81,6 +103,8 @@ export class AssistantDesk {
         id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE, role TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS assistant_group (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, members TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS assistant_room_lifecycle (
+        id TEXT PRIMARY KEY, deleted_at TEXT NOT NULL);
       UPDATE assistant_card SET state='unknown',title='结果待核对' WHERE state='sending';
       UPDATE assistant_card SET state='retry' WHERE state IN ('planning','working','pending');`)
     this.groupWork = new GroupWorkQueue(db, (room, requestId, step, inputs) => this.runWorkStep(room, requestId, step, inputs))
@@ -102,9 +126,34 @@ export class AssistantDesk {
     this.db.prepare('UPDATE assistant_card SET account=?, target=?, meta=? WHERE id=?').run(account.name,target,JSON.stringify({ ...meta, profile: account.id }),id)
   }
   private roster(): Roster {
-    const custom = this.db.prepare("SELECT id, name, role, 'sun' AS color FROM assistant_partner ORDER BY rowid").all() as unknown as Partner[]
-    const groups = this.db.prepare('SELECT id, name, members FROM assistant_group ORDER BY rowid').all() as unknown as GroupRow[]
-    return { partners: [...partners, ...custom], groups: [team, ...groups.map(g => ({ ...g, members: JSON.parse(g.members) as string[] }))] }
+    const profiles = this.db.prepare("SELECT id, name, role, 'sun' AS color FROM assistant_partner ORDER BY rowid").all() as unknown as Partner[]
+    const profilesById = new Map(profiles.map(profile => [profile.id, profile]))
+    const allPartners = partners.map(partner => ({ ...(profilesById.get(partner.id) ?? partner), color: partner.color }))
+    const presetIds = new Set(partners.map(partner => partner.id))
+    allPartners.push(...profiles.filter(profile => !presetIds.has(profile.id)))
+
+    const groupRows = this.db.prepare('SELECT id, name, members FROM assistant_group ORDER BY rowid').all() as unknown as GroupRow[]
+    const allGroups = new Map<string, Group>([[team.id, team]])
+    for (const group of groupRows) allGroups.set(group.id, { ...group, members: JSON.parse(group.members) as string[] })
+
+    const hidden = this.db.prepare('SELECT id FROM assistant_room_lifecycle ORDER BY deleted_at DESC,rowid DESC').all() as { id: string }[]
+    const hiddenIds = new Set(hidden.map(row => row.id))
+    const removedPartners = allPartners.filter(partner => hiddenIds.has(partner.id))
+    const deleted: Roster['deleted'] = []
+    for (const row of hidden) {
+      const removed = removedPartners.find(partner => partner.id === row.id)
+      const group = allGroups.get(row.id)
+      if (removed) deleted.push({ id: row.id, kind: 'partner', name: removed.name })
+      else if (group) deleted.push({ id: row.id, kind: 'group', name: group.name })
+    }
+    return {
+      partners: allPartners.filter(partner => !hiddenIds.has(partner.id)),
+      groups: [...allGroups.values()].filter(group => !hiddenIds.has(group.id))
+        .map(group => ({ ...group, members: group.members.filter(id => !hiddenIds.has(id)) })),
+      removedPartners,
+      deleted,
+      memberLinks: new Map([...allGroups.values()].map(group => [group.id, group.members])),
+    }
   }
   private room(roomId: string, roster: Roster) {
     const group = roster.groups.find(g => g.id === roomId)
@@ -124,37 +173,149 @@ export class AssistantDesk {
       return this.conversation(id)
     }
     const key = nameKey(cmd.name)
-    if (partners.some(p => nameKey(p.name) === key)) throw new AssistantInputError('这个名字已被使用，请换一个')
+    this.assertAvailableName(cmd.name, id, this.roster())
     const inserted = this.db.prepare('INSERT INTO assistant_partner(id,name,name_key,role) VALUES(?,?,?,?) ON CONFLICT(name_key) DO NOTHING')
       .run(id, cmd.name, key, cmd.role)
     if (!inserted.changes) throw new AssistantInputError('这个名字已被使用，请换一个')
     return this.conversation(id)
   }
   private createGroup(cmd: Extract<Command, { op: 'create-group' }>) {
-    const roster = this.roster()
-    const ids = new Set(cmd.members)
-    const members = roster.partners.filter(p => ids.has(p.id)).map(p => p.id)
-    if (members.length !== ids.size) throw new AssistantInputError('有伙伴已不可用，请重新选择群成员')
     const id = 'group-' + (cmd.id ?? randomUUID())
-    const encoded = JSON.stringify(members)
     const existing = this.db.prepare('SELECT name, members FROM assistant_group WHERE id=?').get(id)
     if (existing) {
-      if (existing.name !== cmd.name || existing.members !== encoded) throw new AssistantInputError('群聊资料已变化，请重新创建')
+      const saved = JSON.parse(existing.members as string) as string[]
+      if (existing.name !== cmd.name || saved.length !== cmd.members.length || !saved.every(member => cmd.members.includes(member))) {
+        throw new AssistantInputError('群聊资料已变化，请重新创建')
+      }
     } else {
-      this.db.prepare('INSERT INTO assistant_group(id,name,members) VALUES(?,?,?)').run(id, cmd.name, encoded)
+      const members = this.currentMembers(cmd.members, this.roster())
+      this.db.prepare('INSERT INTO assistant_group(id,name,members) VALUES(?,?,?)').run(id, cmd.name, JSON.stringify(members))
     }
     return this.conversation(id)
+  }
+  private currentMembers(ids: string[], roster: Roster) {
+    const requested = new Set(ids)
+    const members = roster.partners.filter(partner => requested.has(partner.id)).map(partner => partner.id)
+    if (members.length !== requested.size) throw new AssistantInputError('有伙伴已不可用，请重新选择群成员')
+    return members
+  }
+  private assertAvailableName(name: string, id: string, roster: Roster) {
+    const key = nameKey(name)
+    if ([...roster.partners, ...roster.removedPartners].some(partner => partner.id !== id && nameKey(partner.name) === key)) {
+      throw new AssistantInputError('这个名字已被使用，请换一个')
+    }
+  }
+  private updatePartner(cmd: Extract<Command, { op: 'update-partner' }>) {
+    const roster = this.roster()
+    if (!roster.partners.some(partner => partner.id === cmd.id)) throw new AssistantInputError('找不到这个伙伴', 404)
+    this.assertAvailableName(cmd.name, cmd.id, roster)
+    this.db.prepare(`INSERT INTO assistant_partner(id,name,name_key,role) VALUES(?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET name=excluded.name,name_key=excluded.name_key,role=excluded.role`)
+      .run(cmd.id, cmd.name, nameKey(cmd.name), cmd.role)
+    return this.conversation(cmd.id)
+  }
+  private updateGroup(cmd: Extract<Command, { op: 'update-group' }>) {
+    const roster = this.roster()
+    const group = roster.groups.find(group => group.id === cmd.id)
+    if (!group) throw new AssistantInputError('找不到这个群聊', 404)
+    const members = this.currentMembers(cmd.members, roster)
+    const removed = group.members.filter(member => !members.includes(member))
+    const changed = members.length !== group.members.length || removed.length > 0
+    if (changed && members.length < 2) throw new AssistantInputError('请选择至少两位伙伴')
+    if (removed.length) this.assertIdle(group.id, removed)
+
+    const archived = new Set(roster.removedPartners.map(partner => partner.id))
+    const links = roster.memberLinks.get(cmd.id) ?? []
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare(`INSERT INTO assistant_group(id,name,members) VALUES(?,?,?)
+        ON CONFLICT(id) DO UPDATE SET name=excluded.name,members=excluded.members`)
+        .run(cmd.id, cmd.name, JSON.stringify([...members, ...links.filter(id => archived.has(id))]))
+      if (removed.length) this.stopWatches(group.id, removed)
+      this.db.exec('COMMIT')
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+    return this.conversation(cmd.id)
+  }
+  private assertIdle(room: string, authors?: string[]) {
+    const scope = authors ? JSON.stringify(authors) : null
+    const runningActions = this.db.prepare(`SELECT 1 FROM assistant_card WHERE room=? AND state IN ('pending','working','sending')
+      AND (? IS NULL OR author IN (SELECT value FROM json_each(?))) LIMIT 1`).get(room, scope, scope)
+    if (this.busy.has(room) || this.admitting.has(room) || runningActions || this.groupWork.hasActive(room, authors)
+        || [...this.confirming.values()].some(card => card.room === room && (!authors || authors.includes(card.author)))) {
+      throw new AssistantInputError('这里还有任务或钉钉操作正在执行，请等它完成后再试')
+    }
+  }
+  private stopWatches(room: string, authors?: string[]) {
+    const scope = authors ? JSON.stringify(authors) : null
+    this.db.prepare(`UPDATE assistant_card SET state='stopped',title='已停止关注',body=''
+      WHERE room=? AND state='watching' AND (? IS NULL OR author IN (SELECT value FROM json_each(?)))`).run(room, scope, scope)
+  }
+  private deleteRoom(cmd: Extract<Command, { op: 'delete-partner' | 'delete-group' }>) {
+    const roster = this.roster()
+    const partner = cmd.op === 'delete-partner'
+    const kind = partner ? 'partner' : 'group'
+    if (roster.deleted.some(room => room.kind === kind && room.id === cmd.id)) return this.roomAfterChange(cmd.room)
+    const items = partner ? roster.partners : roster.groups
+    if (!items.some(item => item.id === cmd.id)) throw new AssistantInputError('找不到这个会话', 404)
+    const groups = partner ? roster.groups.filter(group => group.members.includes(cmd.id)) : []
+    this.assertIdle(cmd.id)
+    for (const group of groups) this.assertIdle(group.id, [cmd.id])
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      this.db.prepare('INSERT INTO assistant_room_lifecycle(id,deleted_at) VALUES(?,?)').run(cmd.id, iso())
+      this.stopWatches(cmd.id)
+      for (const group of groups) this.stopWatches(group.id, [cmd.id])
+      this.db.exec('COMMIT')
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+    return this.roomAfterChange(cmd.room)
+  }
+  private restoreRoom(cmd: Extract<Command, { op: 'restore-room' }>) {
+    const roster = this.roster()
+    if (!roster.deleted.some(room => room.id === cmd.id) && !this.hasRoom(cmd.id, roster)) {
+      throw new AssistantInputError('找不到这个会话', 404)
+    }
+    this.db.prepare('DELETE FROM assistant_room_lifecycle WHERE id=?').run(cmd.id)
+    return this.roomAfterChange(cmd.room)
+  }
+  private hasRoom(room: string, roster: Roster) {
+    return roster.groups.some(group => group.id === room) || roster.partners.some(partner => partner.id === room)
+  }
+  private roomAfterChange(preferred?: string): AssistantView {
+    const roster = this.roster()
+    const room = preferred && this.hasRoom(preferred, roster) ? preferred
+      : roster.groups.find(group => group.members.length > 0)?.id ?? roster.partners[0]?.id ?? 'home'
+    return this.snapshot(room, roster)
   }
   view(room: string): Card[] {
     return this.conversation(room).cards
   }
   private cards(room: string): Card[] {
-    return this.rows('SELECT id,room,author,kind,title,body,state,account,target FROM (SELECT rowid AS seq,* FROM assistant_card WHERE room=? ORDER BY rowid DESC LIMIT 300) ORDER BY seq', room)
+    return this.rows('SELECT id,room,author,kind,title,body,state,account,target,meta FROM (SELECT rowid AS seq,* FROM assistant_card WHERE room=? ORDER BY rowid DESC LIMIT 300) ORDER BY seq', room)
+      .map(({ meta, ...card }) => {
+        const files = (JSON.parse(meta) as Meta).files
+        return files?.length ? { ...card, files: files.map(fileView) } : card
+      })
+  }
+  async download(room: string, id: string) {
+    this.assertRoom(room)
+    const match = this.db.prepare(`SELECT file.value AS stored FROM assistant_card AS card,
+      json_each(card.meta, '$.files') AS file WHERE card.room=? AND json_extract(file.value, '$.id')=?`).get(room, id)
+    if (!match) throw new AssistantInputError('找不到这个附件', 404)
+    return this.tracked(() => readDownload(this.attachmentStore(), JSON.parse(String(match.stored)) as StoredFile))
   }
   conversation(room: string): AssistantView {
+    if (room === 'home') return this.roomAfterChange()
     const roster = this.roster()
     this.room(room, roster)
-    return { room, ...roster, cards: this.cards(room), work: this.groupWork.list(room) }
+    return this.snapshot(room, roster)
+  }
+  assertRoom(room: string): void {
+    this.room(room, this.roster())
+  }
+  private snapshot(room: string, { partners, groups, deleted, removedPartners }: Roster): AssistantView {
+    const empty = room === 'home'
+    return { room, partners, groups, deleted, removedPartners, fileUploads: !!this.attachmentStore(),
+      cards: empty ? [] : this.cards(room), work: empty ? [] : this.groupWork.list(room) }
   }
   private tracked<T>(job: () => Promise<T>) {
     if (this.closing) throw new Error('助手正在关闭。')
@@ -179,37 +340,76 @@ export class AssistantDesk {
       if (cmd.op === 'login') { await this.workspace().login(); return { account: await this.workspace().account() } }
       if (cmd.op === 'create-partner') return this.createPartner(cmd)
       if (cmd.op === 'create-group') return this.createGroup(cmd)
+      if (cmd.op === 'update-partner') return this.updatePartner(cmd)
+      if (cmd.op === 'update-group') return this.updateGroup(cmd)
+      if (cmd.op === 'delete-partner' || cmd.op === 'delete-group') return this.deleteRoom(cmd)
+      if (cmd.op === 'restore-room') return this.restoreRoom(cmd)
       const roster = this.roster()
       const conversation = this.room(cmd.room, roster)
-      if (cmd.op === 'card') await this.card(cmd)
+      if (cmd.op === 'card') await this.card(cmd, conversation.partners)
       else if (cmd.op === 'retry-work') {
+        const task = this.groupWork.list(cmd.room).find(item => item.id === cmd.id)
+        if (task?.steps.some(step => step.state !== 'done' && !conversation.partners.some(p => p.id === step.partner))) {
+          throw new AssistantInputError('任务需要的伙伴已不在群里，重新加入后可重试')
+        }
         if (!this.groupWork.retry(cmd.room, cmd.id)) throw new AssistantInputError('找不到可重试的任务')
       } else if (cmd.op === 'retry') {
         const row = this.row(cmd.room,cmd.id)
         if (!['retry','connect'].includes(row.state)) return this.conversation(cmd.room)
-        if (row.kind === 'user') await this.message(row)
+        if (row.kind === 'user') {
+          this.assertHasMember(conversation.partners)
+          await this.message(row)
+        }
         else if (row.state === 'connect') {
+          this.assertActiveAuthor(row, conversation.partners)
           const { parent }: Meta = JSON.parse(row.meta)
           const pending = this.rows("SELECT * FROM assistant_card WHERE room=? AND state='connect' AND json_extract(meta,'$.parent')=? ORDER BY rowid",row.room,parent ?? '')
-          for (const item of pending.length ? pending : [row]) await this.perform(item)
-        } else await this.perform(row)
+          const eligible = (pending.length ? pending : [row]).filter(item => conversation.partners.some(p => p.id === item.author))
+          for (const item of eligible) await this.perform(item)
+        } else {
+          this.assertActiveAuthor(row, conversation.partners)
+          await this.perform(row)
+        }
       } else {
+        this.assertHasMember(conversation.partners)
+        if (!cmd.text && !cmd.files.length) throw new AssistantInputError('请填写消息或选择附件')
+        const uploadSignature = fileSignature(cmd.files)
         const existing = this.rows('SELECT * FROM assistant_card WHERE id=?',cmd.id)[0]
         if (existing) {
-          const { mention: previous }: Meta = JSON.parse(existing.meta)
-          if (existing.room !== cmd.room || existing.body !== cmd.text || (cmd.mention && previous !== cmd.mention)) {
+          const prior: Meta = JSON.parse(existing.meta)
+          if (existing.room !== cmd.room || existing.body !== cmd.text || (cmd.mention && prior.mention !== cmd.mention)
+            || prior.uploadSignature !== uploadSignature) {
             throw new AssistantInputError('消息标识冲突，请重新发送')
           }
           return this.conversation(cmd.room)
         }
-        const mention = cmd.mention ?? (conversation.target ? undefined : mentionedPartner(cmd.text, roster.partners))
+        const mention = cmd.mention ?? (conversation.target ? undefined : mentionedPartner(cmd.text, [...roster.partners, ...roster.removedPartners]))
         if (mention && !conversation.partners.some(p => p.id === mention)) throw new AssistantInputError('只能提及当前会话中的伙伴')
-        if (this.busy.has(cmd.room)) throw new Error('上一条消息正在处理，请稍后再发。')
-        this.add(cmd.id,cmd.room,'me','user','planning','',cmd.text,{ mention: mention ?? null })
+        if (this.busy.has(cmd.room) || this.admitting.has(cmd.room) || this.pendingUploads.has(cmd.id)) {
+          throw new AssistantInputError('上一条消息正在处理，请稍后再发')
+        }
+        let files: StoredFile[] | undefined
+        if (cmd.files.length) {
+          this.admitting.add(cmd.room)
+          this.pendingUploads.add(cmd.id)
+          try { files = await storeFiles(this.attachmentStore(), cmd.files) }
+          catch (error) { throw new AssistantInputError(problem(error)) }
+          finally {
+            this.admitting.delete(cmd.room)
+            this.pendingUploads.delete(cmd.id)
+          }
+        }
+        this.add(cmd.id,cmd.room,'me','user','planning','',cmd.text,{ mention: mention ?? null, files, uploadSignature })
         await this.message(this.row(cmd.room,cmd.id))
       }
       return this.conversation(cmd.room)
     })
+  }
+  private assertHasMember(members: Partner[]): void {
+    if (!members.length) throw new AssistantInputError('群里暂时没有伙伴，请添加成员后再发消息')
+  }
+  private assertActiveAuthor(row: Row, members: Partner[]): void {
+    if (!members.some(partner => partner.id === row.author)) throw new AssistantInputError('处理这项工作的伙伴已不在当前会话')
   }
   private async message(row: Row) {
     if (this.busy.has(row.room)) return
@@ -222,7 +422,7 @@ export class AssistantDesk {
       const mention = meta.mention === undefined ? mentionedPartner(row.body, roster.partners) : meta.mention
       const target = conversation.target ?? mention ?? undefined
       if (target && !conversation.partners.some(p => p.id === target)) throw new Error('只能提及当前会话中的伙伴。')
-      const plan = planSchema.parse(await this.plan(row.room, this.history(row), row.body, { ...conversation, target }))
+      const plan = planSchema.parse(await this.plan(row.room, this.history(row), row.body, { ...conversation, target, files: meta.files?.map(fileContext) }))
       const bot = target ?? plan.bot
       if (!conversation.partners.some(p => p.id === bot)) throw new Error('助手未能从当前群成员中选择答复者，请重试。')
       if (plan.work) {
@@ -268,6 +468,7 @@ export class AssistantDesk {
     const result = planSchema.parse(await this.plan(room, this.history(row), row.body, {
       ...conversation,
       target: step.bot,
+      files: (JSON.parse(row.meta) as Meta).files?.map(fileContext),
       workStep: { title: step.title, instructions: step.instructions, inputs },
     }))
     if (result.bot !== step.bot || result.actions.length || result.work || !result.reply.trim()) {
@@ -276,6 +477,7 @@ export class AssistantDesk {
     return result.reply.trim()
   }
   private async perform(row: Row) {
+    this.assertActiveAuthor(row, this.room(row.room, this.roster()).partners)
     const start = this.db.prepare("UPDATE assistant_card SET state='working' WHERE id=? AND state IN ('pending','connect','retry')").run(row.id)
     if (!start.changes) return
     const meta: Meta = JSON.parse(row.meta), a = meta.action!
@@ -315,24 +517,28 @@ export class AssistantDesk {
       }
     } catch (e) { this.update(row.id,sending ? 'unknown' : 'retry',sending ? '请在钉钉核对会邀结果' : labels[a.kind],problem(e)) }
   }
-  private async card(cmd: Extract<Command,{op:'card'}>) {
+  private async card(cmd: Extract<Command,{op:'card'}>, members: Partner[]) {
     const row = this.row(cmd.room,cmd.id)
     if (cmd.action === 'stop') {
       this.db.prepare("UPDATE assistant_card SET state='stopped', title='已停止关注' WHERE id=? AND state='watching'").run(row.id); return
     }
     if (row.state !== 'draft' || row.body !== cmd.previous) throw new Error('草稿已变化，请核对最新版本。')
     if (cmd.action === 'cancel') { this.update(row.id,'canceled','已取消发送',row.body); return }
+    this.assertActiveAuthor(row, members)
     if (cmd.action === 'edit') { this.update(row.id,'draft',row.title,textInput.parse(cmd.body)); return }
-    const meta: Meta = JSON.parse(row.meta), service = this.workspace(), acct = await service.account()
-    if (!acct || acct.id !== meta.profile) throw new Error('请先连接草稿所属的钉钉账号。')
-    const changed = this.db.prepare("UPDATE assistant_card SET state='sending' WHERE id=? AND state='draft' AND body=?").run(row.id,cmd.previous)
-    if (!changed.changes) throw new Error('草稿已处理或修改。')
+    if (this.confirming.has(row.id)) throw new Error('草稿正在处理。')
+    this.confirming.set(row.id, row)
     try {
-      const receipt = await service.send(acct.id,meta.group!.id,row.body,row.id)
-      this.bind(row.id,acct,row.target,{...meta,receipt})
-      this.update(row.id,'done','群消息已发送',row.body)
-    }
-    catch { this.update(row.id,'unknown','发送结果待核对',row.body) }
+      const meta: Meta = JSON.parse(row.meta), service = this.workspace(), acct = await service.account()
+      if (!acct || acct.id !== meta.profile) throw new Error('请先连接草稿所属的钉钉账号。')
+      const changed = this.db.prepare("UPDATE assistant_card SET state='sending' WHERE id=? AND state='draft' AND body=?").run(row.id,cmd.previous)
+      if (!changed.changes) throw new Error('草稿已处理或修改。')
+      try {
+        const receipt = await service.send(acct.id,meta.group!.id,row.body,row.id)
+        this.bind(row.id,acct,row.target,{...meta,receipt})
+        this.update(row.id,'done','群消息已发送',row.body)
+      } catch { this.update(row.id,'unknown','发送结果待核对',row.body) }
+    } finally { this.confirming.delete(row.id) }
   }
   async tick() {
     if (this.polling || this.closing) return
@@ -347,6 +553,7 @@ export class AssistantDesk {
         return
       }
       for (const row of watches) {
+        if (this.row(row.room,row.id).state !== 'watching') continue
         const meta: Meta = JSON.parse(row.meta)
         try {
           if (!acct || acct.id !== meta.profile) throw new Error('等待原钉钉账号重新连接。')
