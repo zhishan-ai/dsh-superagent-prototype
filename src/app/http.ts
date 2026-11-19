@@ -28,7 +28,7 @@ import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 
-import type { AssistantDesk } from '../assistant/desk.ts'
+import { AssistantInputError, type AssistantDesk } from '../assistant/desk.ts'
 
 export interface HttpHost {
   readonly assistant: AssistantDesk
@@ -87,7 +87,7 @@ function failure(error: unknown): [number, Record<string, unknown>] {
     return [400, { error: `Invalid settings: ${issues.map(issue => issue.path).join(', ')}`, issues }]
   }
   if (error instanceof SetupError) return [400, { error: error.message, setup: error.problem }]
-  if (error instanceof RouteError) return [error.status, { error: error.message }]
+  if (error instanceof RouteError || error instanceof AssistantInputError) return [error.status, { error: error.message }]
   if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
   if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
   return [500, { error: error instanceof Error ? error.message : String(error) }]
@@ -156,7 +156,7 @@ function routes(runtime: HttpHost): Routes {
   const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
-    'GET assistant/:room': ({ params }) => runtime.assistant.view(params.room),
+    'GET assistant/:room': ({ params }) => runtime.assistant.conversation(params.room),
     'POST assistant': async ({ body }) => runtime.assistant.execute(await body()),
     'GET state': () => stateView(runtime),
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, vi } from 'vitest'
 import { z } from 'zod'
 import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { Api, ApiResponse, RouteParams } from '../../src/app/api.ts'
+import { partners, team } from '../../src/assistant/contracts.ts'
 import { SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInPart, builtInParts, composePrompt, composeSkill, defaultPrompts,
   environmentSection, policySection, promptParts } from '../../src/app/prompts.ts'
 import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, SourceStatusRow, SourceView, StateView, ThreadPageView,
@@ -291,7 +292,7 @@ const ticketOf = (id: string) =>
 const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
-  'GET assistant/:room': { answer: () => [] },
+  'GET assistant/:room': { answer: ({ params }) => ({ room: params.room, partners: [...partners], groups: [team], cards: [] }) },
   'POST assistant': { answer: () => [] },
   'GET state': { answer: stateView },
   'GET overview': { answer: overviewView },

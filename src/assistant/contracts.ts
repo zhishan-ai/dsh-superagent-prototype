@@ -1,10 +1,45 @@
-export const partners = [
+export interface Partner {
+  id: string
+  name: string
+  role: string
+  color: '' | 'violet' | 'teal' | 'sun'
+}
+export interface Group {
+  id: string
+  name: string
+  members: string[]
+}
+export interface AssistantView {
+  room: string
+  partners: Partner[]
+  groups: Group[]
+  cards: Card[]
+  work?: GroupWork[]
+}
+
+export interface GroupWorkStep {
+  id: string
+  partner: string
+  title: string
+  dependsOn: string[]
+  state: 'waiting' | 'running' | 'done' | 'failed'
+  output: string
+}
+
+export interface GroupWork {
+  id: string
+  requestId: string
+  title: string
+  state: 'running' | 'done' | 'failed'
+  steps: GroupWorkStep[]
+}
+
+export const partners: readonly Partner[] = [
   { id: 'white', name: '小白', role: '日程与协作', color: '' },
   { id: 'violet', name: '栗子', role: '文档与写作', color: 'violet' },
   { id: 'teal', name: '青团', role: '消息与跟进', color: 'teal' },
-] as const
-export const rooms = ['team', ...partners.map(p => p.id)]
-export const roomName = (id: string) => partners.find(p => p.id === id)?.name ?? '助手群'
+]
+export const team: Group = { id: 'team', name: '助手群', members: partners.map(p => p.id) }
 export interface Identity { id: string; name: string }
 export interface Workspace {
   account(): Promise<Identity | null>

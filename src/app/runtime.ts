@@ -206,6 +206,7 @@ export class Runtime extends Service implements SourceHost {
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
+    this.assistant.resumeGroupWork()
     const poll = () => { void this.assistant.tick().catch(() => { /* retry on the next tick */ }) }
     const timer = setInterval(poll, 15_000)
     timer.unref()

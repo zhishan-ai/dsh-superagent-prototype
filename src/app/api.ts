@@ -18,7 +18,7 @@ interface Paged { offset?: number; limit?: number }
 type Delivery = 'injected' | 'pending'
 
 export interface Api {
-  'GET assistant/:room': { response: import('../assistant/contracts.ts').Card[] }
+  'GET assistant/:room': { response: import('../assistant/contracts.ts').AssistantView }
   'POST assistant': { response: unknown }
   'GET state': { response: StateView }
   'GET overview': { response: OverviewView }

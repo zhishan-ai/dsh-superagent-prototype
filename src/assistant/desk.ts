@@ -1,21 +1,48 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { randomUUID, createHash } from 'node:crypto'
 import { z } from 'zod'
-import { partners, rooms, type Card, type Identity, type Workspace } from './contracts.ts'
+import { partners, team, type AssistantView, type Card, type Group, type Identity, type Partner, type Workspace } from './contracts.ts'
+import { GroupWorkQueue, validateWork, type WorkInput, type WorkStep } from './group-work.ts'
 import { planSchema, type Action, type Planner } from './planner.ts'
 
-const roomId = z.string().refine(v => rooms.includes(v), '未知会话')
+const roomId = z.string().min(1).max(64)
 const textInput = z.string().trim().min(1).max(8000)
+const partnerName = z.string().trim().min(1).max(16)
+  .refine(name => !/[@＠\r\n\t]/.test(name), '伙伴名字不能包含 @ 或换行')
+  .transform(name => name.normalize('NFC'))
+const nameKey = (name: string) => name.normalize('NFC').toLowerCase()
 export const command = z.discriminatedUnion('op', [
-  z.object({ op: z.literal('message'), room: roomId, id: z.uuid(), text: textInput }),
+  z.object({ op: z.literal('message'), room: roomId, id: z.uuid(), text: textInput, mention: roomId.optional() }),
+  z.object({ op: z.literal('create-partner'), id: z.uuid().optional(), name: partnerName, role: z.string().trim().min(1).max(80) }),
+  z.object({ op: z.literal('create-group'), id: z.uuid().optional(), name: z.string().trim().min(1).max(32),
+    members: z.array(roomId).min(2, '请选择至少两位伙伴').refine(ids => new Set(ids).size === ids.length, '请勿重复选择伙伴') }),
   z.object({ op: z.literal('retry'), room: roomId, id: z.string() }),
+  z.object({ op: z.literal('retry-work'), room: roomId, id: z.uuid() }),
   z.object({ op: z.literal('card'), room: roomId, id: z.string(), action: z.enum(['confirm','edit','cancel','stop']), previous: z.string().max(8000), body: textInput.optional() }),
   z.object({ op: z.literal('login') }),
   z.object({ op: z.literal('connection') }),
 ])
 type Command = z.infer<typeof command>
-interface Meta { parent?: string; receipt?: string; action?: Action; profile?: string; group?: Identity; person?: Identity; since?: string; until?: string; token?: string }
+interface Meta { parent?: string; mention?: string | null; receipt?: string; action?: Action; profile?: string; group?: Identity; person?: Identity; since?: string; until?: string; token?: string }
 interface Row extends Card { meta: string }
+interface GroupRow extends Omit<Group, 'members'> { members: string }
+interface Roster { partners: Partner[]; groups: Group[] }
+
+/** Invalid assistant input that the panel can present to the user. */
+export class AssistantInputError extends Error {
+  constructor(message: string, readonly status: 400 | 404 = 400) { super(message) }
+}
+
+function mentionedPartner(text: string, roster: Partner[]) {
+  const request = text.normalize('NFC')
+  const names = [...roster].sort((a, b) => b.name.length - a.name.length)
+  for (const match of request.matchAll(/[@＠]/g)) {
+    const tail = request.slice(match.index + 1)
+    const partner = names.find(p => tail.startsWith(p.name)
+      && !(/[a-z\d]$/i.test(p.name) && /^[a-z\d_]/i.test(tail.slice(p.name.length))))
+    if (partner) return partner.id
+  }
+}
 const iso = () => new Date().toISOString()
 const display = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value, null, 2) || '').slice(0, 32000)
 const problem = (e: unknown) => e instanceof Error ? e.message : '操作未完成。'
@@ -39,6 +66,7 @@ function agendaText(value: unknown) {
 
 /** Durable personal conversations and account-bound DingTalk actions in the Superagent store. */
 export class AssistantDesk {
+  private readonly groupWork: GroupWorkQueue
   private readonly work = new Set<Promise<unknown>>()
   private readonly busy = new Set<string>()
   private polling = false
@@ -49,8 +77,13 @@ export class AssistantDesk {
       title TEXT NOT NULL, body TEXT NOT NULL, account TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '{}');
       CREATE INDEX IF NOT EXISTS assistant_room ON assistant_card(room);
       CREATE INDEX IF NOT EXISTS assistant_state ON assistant_card(state);
+      CREATE TABLE IF NOT EXISTS assistant_partner (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE, role TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS assistant_group (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, members TEXT NOT NULL);
       UPDATE assistant_card SET state='unknown',title='结果待核对' WHERE state='sending';
       UPDATE assistant_card SET state='retry' WHERE state IN ('planning','working','pending');`)
+    this.groupWork = new GroupWorkQueue(db, (room, requestId, step, inputs) => this.runWorkStep(room, requestId, step, inputs))
   }
   private rows(sql: string, ...params: string[]) { return this.db.prepare(sql).all(...params) as unknown as Row[] }
   private row(room: string, id: string) {
@@ -68,9 +101,60 @@ export class AssistantDesk {
   private bind(id: string, account: Identity, target: string, meta: Meta) {
     this.db.prepare('UPDATE assistant_card SET account=?, target=?, meta=? WHERE id=?').run(account.name,target,JSON.stringify({ ...meta, profile: account.id }),id)
   }
+  private roster(): Roster {
+    const custom = this.db.prepare("SELECT id, name, role, 'sun' AS color FROM assistant_partner ORDER BY rowid").all() as unknown as Partner[]
+    const groups = this.db.prepare('SELECT id, name, members FROM assistant_group ORDER BY rowid').all() as unknown as GroupRow[]
+    return { partners: [...partners, ...custom], groups: [team, ...groups.map(g => ({ ...g, members: JSON.parse(g.members) as string[] }))] }
+  }
+  private room(roomId: string, roster: Roster) {
+    const group = roster.groups.find(g => g.id === roomId)
+    if (group) {
+      const members = new Set(group.members)
+      return { name: group.name, partners: roster.partners.filter(p => members.has(p.id)), target: undefined }
+    }
+    const partner = roster.partners.find(p => p.id === roomId)
+    if (partner) return { name: partner.name, partners: [partner], target: partner.id }
+    throw new AssistantInputError('找不到这个会话', 404)
+  }
+  private createPartner(cmd: Extract<Command, { op: 'create-partner' }>) {
+    const id = 'partner-' + (cmd.id ?? randomUUID())
+    const existing = this.db.prepare('SELECT name, role FROM assistant_partner WHERE id=?').get(id)
+    if (existing) {
+      if (existing.name !== cmd.name || existing.role !== cmd.role) throw new AssistantInputError('伙伴资料已变化，请重新创建')
+      return this.conversation(id)
+    }
+    const key = nameKey(cmd.name)
+    if (partners.some(p => nameKey(p.name) === key)) throw new AssistantInputError('这个名字已被使用，请换一个')
+    const inserted = this.db.prepare('INSERT INTO assistant_partner(id,name,name_key,role) VALUES(?,?,?,?) ON CONFLICT(name_key) DO NOTHING')
+      .run(id, cmd.name, key, cmd.role)
+    if (!inserted.changes) throw new AssistantInputError('这个名字已被使用，请换一个')
+    return this.conversation(id)
+  }
+  private createGroup(cmd: Extract<Command, { op: 'create-group' }>) {
+    const roster = this.roster()
+    const ids = new Set(cmd.members)
+    const members = roster.partners.filter(p => ids.has(p.id)).map(p => p.id)
+    if (members.length !== ids.size) throw new AssistantInputError('有伙伴已不可用，请重新选择群成员')
+    const id = 'group-' + (cmd.id ?? randomUUID())
+    const encoded = JSON.stringify(members)
+    const existing = this.db.prepare('SELECT name, members FROM assistant_group WHERE id=?').get(id)
+    if (existing) {
+      if (existing.name !== cmd.name || existing.members !== encoded) throw new AssistantInputError('群聊资料已变化，请重新创建')
+    } else {
+      this.db.prepare('INSERT INTO assistant_group(id,name,members) VALUES(?,?,?)').run(id, cmd.name, encoded)
+    }
+    return this.conversation(id)
+  }
   view(room: string): Card[] {
-    roomId.parse(room)
-    return this.rows('SELECT id,room,author,kind,title,body,state,account,target FROM (SELECT rowid AS seq,* FROM assistant_card WHERE room=? ORDER BY rowid DESC LIMIT 300) ORDER BY seq',room)
+    return this.conversation(room).cards
+  }
+  private cards(room: string): Card[] {
+    return this.rows('SELECT id,room,author,kind,title,body,state,account,target FROM (SELECT rowid AS seq,* FROM assistant_card WHERE room=? ORDER BY rowid DESC LIMIT 300) ORDER BY seq', room)
+  }
+  conversation(room: string): AssistantView {
+    const roster = this.roster()
+    this.room(room, roster)
+    return { room, ...roster, cards: this.cards(room), work: this.groupWork.list(room) }
   }
   private tracked<T>(job: () => Promise<T>) {
     if (this.closing) throw new Error('助手正在关闭。')
@@ -78,7 +162,11 @@ export class AssistantDesk {
     void p.finally(() => this.work.delete(p)).catch(() => {})
     return p
   }
-  async stop() { this.closing = true; await Promise.allSettled(this.work) }
+  resumeGroupWork() { this.groupWork.resume() }
+  async stop() {
+    this.closing = true
+    await Promise.allSettled([this.groupWork.stop(), ...this.work])
+  }
   private workspace() {
     const service = this.provider()
     if (!service) throw new Error('请在当前 DSH profile 安装并启用 dsh-dingtalk。')
@@ -89,10 +177,16 @@ export class AssistantDesk {
     return this.tracked(async () => {
       if (cmd.op === 'connection') return { installed: !!this.provider(), account: await this.provider()?.account() ?? null }
       if (cmd.op === 'login') { await this.workspace().login(); return { account: await this.workspace().account() } }
+      if (cmd.op === 'create-partner') return this.createPartner(cmd)
+      if (cmd.op === 'create-group') return this.createGroup(cmd)
+      const roster = this.roster()
+      const conversation = this.room(cmd.room, roster)
       if (cmd.op === 'card') await this.card(cmd)
-      else if (cmd.op === 'retry') {
+      else if (cmd.op === 'retry-work') {
+        if (!this.groupWork.retry(cmd.room, cmd.id)) throw new AssistantInputError('找不到可重试的任务')
+      } else if (cmd.op === 'retry') {
         const row = this.row(cmd.room,cmd.id)
-        if (!['retry','connect'].includes(row.state)) return this.view(cmd.room)
+        if (!['retry','connect'].includes(row.state)) return this.conversation(cmd.room)
         if (row.kind === 'user') await this.message(row)
         else if (row.state === 'connect') {
           const { parent }: Meta = JSON.parse(row.meta)
@@ -102,14 +196,19 @@ export class AssistantDesk {
       } else {
         const existing = this.rows('SELECT * FROM assistant_card WHERE id=?',cmd.id)[0]
         if (existing) {
-          if (existing.room !== cmd.room || existing.body !== cmd.text) throw new Error('消息标识冲突。')
-          return this.view(cmd.room)
+          const { mention: previous }: Meta = JSON.parse(existing.meta)
+          if (existing.room !== cmd.room || existing.body !== cmd.text || (cmd.mention && previous !== cmd.mention)) {
+            throw new AssistantInputError('消息标识冲突，请重新发送')
+          }
+          return this.conversation(cmd.room)
         }
+        const mention = cmd.mention ?? (conversation.target ? undefined : mentionedPartner(cmd.text, roster.partners))
+        if (mention && !conversation.partners.some(p => p.id === mention)) throw new AssistantInputError('只能提及当前会话中的伙伴')
         if (this.busy.has(cmd.room)) throw new Error('上一条消息正在处理，请稍后再发。')
-        this.add(cmd.id,cmd.room,'me','user','planning','',cmd.text)
+        this.add(cmd.id,cmd.room,'me','user','planning','',cmd.text,{ mention: mention ?? null })
         await this.message(this.row(cmd.room,cmd.id))
       }
-      return this.view(cmd.room)
+      return this.conversation(cmd.room)
     })
   }
   private async message(row: Row) {
@@ -117,10 +216,22 @@ export class AssistantDesk {
     this.busy.add(row.room)
     this.update(row.id,'planning','',row.body)
     try {
-      const previous = this.view(row.room).filter(c => c.id !== row.id && c.kind !== 'incoming').slice(-16)
-        .map(c => [c.author,c.title,c.body.slice(0,1400)])
-      const plan = planSchema.parse(await this.plan(row.room,JSON.stringify(previous),row.body))
-      const bot = row.room === 'team' ? partners.find(p => row.body.includes('@'+p.name))?.id ?? plan.bot : row.room
+      const roster = this.roster()
+      const conversation = this.room(row.room, roster)
+      const meta: Meta = JSON.parse(row.meta)
+      const mention = meta.mention === undefined ? mentionedPartner(row.body, roster.partners) : meta.mention
+      const target = conversation.target ?? mention ?? undefined
+      if (target && !conversation.partners.some(p => p.id === target)) throw new Error('只能提及当前会话中的伙伴。')
+      const plan = planSchema.parse(await this.plan(row.room, this.history(row), row.body, { ...conversation, target }))
+      const bot = target ?? plan.bot
+      if (!conversation.partners.some(p => p.id === bot)) throw new Error('助手未能从当前群成员中选择答复者，请重试。')
+      if (plan.work) {
+        if (conversation.target || plan.actions.length) throw new Error('这次分工需要在群聊中单独安排，请重试。')
+        validateWork(plan.work, conversation.partners.map(p => p.id))
+        if (target && !plan.work.steps.some(step => step.bot === target && !step.dependsOn.length)) {
+          throw new Error('被提及的伙伴需要先接手一项工作，请重试。')
+        }
+      }
       for (const a of plan.actions) {
         if (a.kind === 'invite' && (!row.body.includes(a.mandate) || !/(邀|约|安排.{0,12}会|组织.{0,12}会|schedule|invite|book)/i.test(a.mandate)
           || /(?:不要|先不|暂不|别|取消|do not|don't).{0,12}(?:发|邀|约|安排|schedule|invite)/i.test(row.body))) {
@@ -131,16 +242,38 @@ export class AssistantDesk {
       this.db.exec('BEGIN IMMEDIATE')
       try {
         this.update(row.id,'done','',row.body)
-        if (plan.reply || !plan.actions.length) this.add(randomUUID(),row.room,bot,'text','done','',plan.reply || '你想先处理哪件事？')
+        if (plan.work) this.groupWork.create(row.room, row.id, plan.work)
+        else if (plan.reply || !plan.actions.length) this.add(randomUUID(),row.room,bot,'text','done','',plan.reply || '你想先处理哪件事？')
         for (const a of plan.actions) {
           const id = randomUUID(); ids.push(id)
           this.add(id,row.room,bot,a.kind,'pending',labels[a.kind],'',{ parent:row.id, action:a })
         }
         this.db.exec('COMMIT')
       } catch (e) { this.db.exec('ROLLBACK'); throw e }
+      if (plan.work) this.groupWork.resume()
       for (const id of ids) await this.perform(this.row(row.room,id))
     } catch (e) { this.update(row.id,'retry',problem(e),row.body) }
     finally { this.busy.delete(row.room) }
+  }
+  private history(row: Row) {
+    const previous = this.db.prepare(`SELECT author, title, substr(body, 1, 1400) AS excerpt FROM assistant_card
+      WHERE room=? AND kind<>'incoming' AND rowid<(SELECT rowid FROM assistant_card WHERE id=?)
+      ORDER BY rowid DESC LIMIT 16`).all(row.room, row.id)
+    return JSON.stringify(previous.reverse().map(card => [card.author, card.title, card.excerpt]))
+  }
+  private async runWorkStep(room: string, requestId: string, step: WorkStep, inputs: WorkInput[]) {
+    const row = this.row(room, requestId)
+    const conversation = this.room(room, this.roster())
+    if (!conversation.partners.some(partner => partner.id === step.bot)) throw new Error('该伙伴已无法参与当前群聊')
+    const result = planSchema.parse(await this.plan(room, this.history(row), row.body, {
+      ...conversation,
+      target: step.bot,
+      workStep: { title: step.title, instructions: step.instructions, inputs },
+    }))
+    if (result.bot !== step.bot || result.actions.length || result.work || !result.reply.trim()) {
+      throw new Error('该步骤未返回可交接的成果，请重试')
+    }
+    return result.reply.trim()
   }
   private async perform(row: Row) {
     const start = this.db.prepare("UPDATE assistant_card SET state='working' WHERE id=? AND state IN ('pending','connect','retry')").run(row.id)
