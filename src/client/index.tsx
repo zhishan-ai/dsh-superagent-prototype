@@ -11,6 +11,7 @@ import type { PluginConfigViewProps } from '@deepseek-ai/dsh-client-ui-plugin-ma
 import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { openKnownSession, SessionNavigationError } from '../navigation.ts'
+import { Assistant } from './assistant.tsx'
 import { App } from './app.tsx'
 import { PluginConfig, usePageForm } from './deployment.tsx'
 import { en, zh } from './locales.ts'
@@ -42,7 +43,7 @@ function Mounted({ ctx, t }: { ctx: ClientContext; t: T }) {
     }
   }, [ctx, t])
   const form = usePageForm(ctx.get('configForms')?.get<Record<string, unknown>>(ENTRY))
-  return <App t={t} openSession={openSession} deploymentForm={form} />
+  return <Assistant><App t={t} openSession={openSession} deploymentForm={form} /></Assistant>
 }
 
 export const inject = ['slots', 'locale', 'sessions', 'uiWorkspace']

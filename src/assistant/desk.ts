@@ -1,0 +1,240 @@
+import type { DatabaseSync } from 'node:sqlite'
+import { randomUUID, createHash } from 'node:crypto'
+import { z } from 'zod'
+import { partners, rooms, type Card, type Identity, type Workspace } from './contracts.ts'
+import { planSchema, type Action, type Planner } from './planner.ts'
+
+const roomId = z.string().refine(v => rooms.includes(v), '未知会话')
+const textInput = z.string().trim().min(1).max(8000)
+export const command = z.discriminatedUnion('op', [
+  z.object({ op: z.literal('message'), room: roomId, id: z.uuid(), text: textInput }),
+  z.object({ op: z.literal('retry'), room: roomId, id: z.string() }),
+  z.object({ op: z.literal('card'), room: roomId, id: z.string(), action: z.enum(['confirm','edit','cancel','stop']), previous: z.string().max(8000), body: textInput.optional() }),
+  z.object({ op: z.literal('login') }),
+  z.object({ op: z.literal('connection') }),
+])
+type Command = z.infer<typeof command>
+interface Meta { parent?: string; receipt?: string; action?: Action; profile?: string; group?: Identity; person?: Identity; since?: string; until?: string; token?: string }
+interface Row extends Card { meta: string }
+const iso = () => new Date().toISOString()
+const display = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value, null, 2) || '').slice(0, 32000)
+const problem = (e: unknown) => e instanceof Error ? e.message : '操作未完成。'
+const labels = { agenda: '查日程', document: '读文档', invite: '发会邀', draft: '群消息草稿', watch: '留意同事回复' }
+const fullDate = (value: string) => new Date(value).toLocaleString('zh-CN', { dateStyle: 'short', timeStyle: 'short' })
+function agendaText(value: unknown) {
+  const data = value as { events?: { title?: string; summary?: string; start?: unknown; end?: unknown; startTime?: unknown; endTime?: unknown }[]; hasMore?: boolean }
+  if (value && typeof value === 'object' && 'busy' in value && Array.isArray(value.busy)) {
+    return value.busy.length ? value.busy.map(slot => '忙碌 · '+fullDate(slot.start)+' – '+fullDate(slot.end)).join('\n') : '所查同事在这个时段都有空。'
+  }
+  if (!Array.isArray(data?.events)) return display(value)
+  if (!data.events.length) return '这个时段没有日程。'
+  const when = (v: unknown) => {
+    if (typeof v === 'number') return new Date(v).toLocaleString('zh-CN')
+    const raw = typeof v === 'string' ? v : (v as { dateTime?: string; date?: string })?.dateTime ?? (v as { date?: string })?.date
+    return raw && Number.isFinite(Date.parse(raw)) ? fullDate(raw) : ''
+  }
+  return data.events.map(e => [e.summary || e.title || '日程', [when(e.start ?? e.startTime), when(e.end ?? e.endTime)].filter(Boolean).join(' – ')].filter(Boolean).join('\n')).join('\n\n')
+    + (data.hasMore ? '\n还有更多日程，请缩短查询时段。' : '')
+}
+
+/** Durable personal conversations and account-bound DingTalk actions in the Superagent store. */
+export class AssistantDesk {
+  private readonly work = new Set<Promise<unknown>>()
+  private readonly busy = new Set<string>()
+  private polling = false
+  private closing = false
+  constructor(private db: DatabaseSync, private provider: () => Workspace | undefined, private plan: Planner) {
+    db.exec(`CREATE TABLE IF NOT EXISTS assistant_card (
+      id TEXT PRIMARY KEY, room TEXT NOT NULL, author TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+      title TEXT NOT NULL, body TEXT NOT NULL, account TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '{}');
+      CREATE INDEX IF NOT EXISTS assistant_room ON assistant_card(room);
+      CREATE INDEX IF NOT EXISTS assistant_state ON assistant_card(state);
+      UPDATE assistant_card SET state='unknown',title='结果待核对' WHERE state='sending';
+      UPDATE assistant_card SET state='retry' WHERE state IN ('planning','working','pending');`)
+  }
+  private rows(sql: string, ...params: string[]) { return this.db.prepare(sql).all(...params) as unknown as Row[] }
+  private row(room: string, id: string) {
+    const row = this.rows('SELECT * FROM assistant_card WHERE room=? AND id=?', room, id)[0]
+    if (!row) throw new Error('找不到这条消息。')
+    return row
+  }
+  private add(id: string, room: string, author: string, kind: string, state: string, title: string, body: string, meta: Meta = {}) {
+    this.db.prepare('INSERT INTO assistant_card(id,room,author,kind,state,title,body,meta) VALUES(?,?,?,?,?,?,?,?)')
+      .run(id, room, author, kind, state, title, body, JSON.stringify(meta))
+  }
+  private update(id: string, state: string, title: string, body: string) {
+    this.db.prepare('UPDATE assistant_card SET state=?, title=?, body=? WHERE id=?').run(state,title,body,id)
+  }
+  private bind(id: string, account: Identity, target: string, meta: Meta) {
+    this.db.prepare('UPDATE assistant_card SET account=?, target=?, meta=? WHERE id=?').run(account.name,target,JSON.stringify({ ...meta, profile: account.id }),id)
+  }
+  view(room: string): Card[] {
+    roomId.parse(room)
+    return this.rows('SELECT id,room,author,kind,title,body,state,account,target FROM (SELECT rowid AS seq,* FROM assistant_card WHERE room=? ORDER BY rowid DESC LIMIT 300) ORDER BY seq',room)
+  }
+  private tracked<T>(job: () => Promise<T>) {
+    if (this.closing) throw new Error('助手正在关闭。')
+    const p = job(); this.work.add(p)
+    void p.finally(() => this.work.delete(p)).catch(() => {})
+    return p
+  }
+  async stop() { this.closing = true; await Promise.allSettled(this.work) }
+  private workspace() {
+    const service = this.provider()
+    if (!service) throw new Error('请在当前 DSH profile 安装并启用 dsh-dingtalk。')
+    return service
+  }
+  execute(input: unknown) {
+    const cmd = command.parse(input)
+    return this.tracked(async () => {
+      if (cmd.op === 'connection') return { installed: !!this.provider(), account: await this.provider()?.account() ?? null }
+      if (cmd.op === 'login') { await this.workspace().login(); return { account: await this.workspace().account() } }
+      if (cmd.op === 'card') await this.card(cmd)
+      else if (cmd.op === 'retry') {
+        const row = this.row(cmd.room,cmd.id)
+        if (!['retry','connect'].includes(row.state)) return this.view(cmd.room)
+        if (row.kind === 'user') await this.message(row)
+        else if (row.state === 'connect') {
+          const { parent }: Meta = JSON.parse(row.meta)
+          const pending = this.rows("SELECT * FROM assistant_card WHERE room=? AND state='connect' AND json_extract(meta,'$.parent')=? ORDER BY rowid",row.room,parent ?? '')
+          for (const item of pending.length ? pending : [row]) await this.perform(item)
+        } else await this.perform(row)
+      } else {
+        const existing = this.rows('SELECT * FROM assistant_card WHERE id=?',cmd.id)[0]
+        if (existing) {
+          if (existing.room !== cmd.room || existing.body !== cmd.text) throw new Error('消息标识冲突。')
+          return this.view(cmd.room)
+        }
+        if (this.busy.has(cmd.room)) throw new Error('上一条消息正在处理，请稍后再发。')
+        this.add(cmd.id,cmd.room,'me','user','planning','',cmd.text)
+        await this.message(this.row(cmd.room,cmd.id))
+      }
+      return this.view(cmd.room)
+    })
+  }
+  private async message(row: Row) {
+    if (this.busy.has(row.room)) return
+    this.busy.add(row.room)
+    this.update(row.id,'planning','',row.body)
+    try {
+      const previous = this.view(row.room).filter(c => c.id !== row.id && c.kind !== 'incoming').slice(-16)
+        .map(c => [c.author,c.title,c.body.slice(0,1400)])
+      const plan = planSchema.parse(await this.plan(row.room,JSON.stringify(previous),row.body))
+      const bot = row.room === 'team' ? partners.find(p => row.body.includes('@'+p.name))?.id ?? plan.bot : row.room
+      for (const a of plan.actions) {
+        if (a.kind === 'invite' && (!row.body.includes(a.mandate) || !/(邀|约|安排.{0,12}会|组织.{0,12}会|schedule|invite|book)/i.test(a.mandate)
+          || /(?:不要|先不|暂不|别|取消|do not|don't).{0,12}(?:发|邀|约|安排|schedule|invite)/i.test(row.body))) {
+          throw new Error('请明确说明要发会邀，以及希望邀请的同事和时间。')
+        }
+      }
+      const ids: string[] = []
+      this.db.exec('BEGIN IMMEDIATE')
+      try {
+        this.update(row.id,'done','',row.body)
+        if (plan.reply || !plan.actions.length) this.add(randomUUID(),row.room,bot,'text','done','',plan.reply || '你想先处理哪件事？')
+        for (const a of plan.actions) {
+          const id = randomUUID(); ids.push(id)
+          this.add(id,row.room,bot,a.kind,'pending',labels[a.kind],'',{ parent:row.id, action:a })
+        }
+        this.db.exec('COMMIT')
+      } catch (e) { this.db.exec('ROLLBACK'); throw e }
+      for (const id of ids) await this.perform(this.row(row.room,id))
+    } catch (e) { this.update(row.id,'retry',problem(e),row.body) }
+    finally { this.busy.delete(row.room) }
+  }
+  private async perform(row: Row) {
+    const start = this.db.prepare("UPDATE assistant_card SET state='working' WHERE id=? AND state IN ('pending','connect','retry')").run(row.id)
+    if (!start.changes) return
+    const meta: Meta = JSON.parse(row.meta), a = meta.action!
+    let sending = false
+    try {
+      const service = this.workspace(), acct = await service.account()
+      if (!acct) { this.update(row.id,'connect',labels[a.kind],'登录钉钉后可以继续这件事。'); return }
+      if (meta.profile && meta.profile !== acct.id) throw new Error('请切回原钉钉账号。')
+      this.bind(row.id,acct,'',meta)
+      if (a.kind === 'document') {
+        const doc = await service.document(acct.id,a.query)
+        this.update(row.id,'done',doc.title,display(doc.content))
+      } else if (a.kind === 'agenda' || a.kind === 'invite') {
+        const people = await Promise.all(a.people.map(p => service.person(acct.id,p)))
+        const ids = [...new Set(people.map(p => p.id))]
+        this.bind(row.id,acct,people.map(p => p.name).join('、'),meta)
+        if (a.kind === 'agenda') {
+          const data = ids.length ? await service.busy(acct.id,ids,a.start,a.end) : await service.agenda(acct.id,a.start,a.end)
+          this.update(row.id,'done',ids.length ? '同事闲忙' : '我的日程',agendaText(data))
+        } else {
+          const detail = a.title+'\n'+fullDate(a.start)+' – '+fullDate(a.end)
+          this.update(row.id,'sending','正在创建会邀',detail); sending = true
+          const receipt = await service.invite(acct.id,a.title,a.start,a.end,ids)
+          this.bind(row.id,acct,people.map(p => p.name).join('、'),{...meta,receipt})
+          this.update(row.id,'done','会邀已发',detail)
+        }
+      } else {
+        const group = await service.group(acct.id,a.group)
+        if (a.kind === 'draft') {
+          this.bind(row.id,acct,group.name,{...meta,group})
+          this.update(row.id,'draft','确认发送群消息',a.body)
+        } else {
+          const person = await service.person(acct.id,a.person)
+          this.bind(row.id,acct,group.name,{...meta,person,group,since:iso()})
+          this.update(row.id,'watching','正在留意'+person.name+'的回复','新消息会出现在这个会话。')
+        }
+      }
+    } catch (e) { this.update(row.id,sending ? 'unknown' : 'retry',sending ? '请在钉钉核对会邀结果' : labels[a.kind],problem(e)) }
+  }
+  private async card(cmd: Extract<Command,{op:'card'}>) {
+    const row = this.row(cmd.room,cmd.id)
+    if (cmd.action === 'stop') {
+      this.db.prepare("UPDATE assistant_card SET state='stopped', title='已停止关注' WHERE id=? AND state='watching'").run(row.id); return
+    }
+    if (row.state !== 'draft' || row.body !== cmd.previous) throw new Error('草稿已变化，请核对最新版本。')
+    if (cmd.action === 'cancel') { this.update(row.id,'canceled','已取消发送',row.body); return }
+    if (cmd.action === 'edit') { this.update(row.id,'draft',row.title,textInput.parse(cmd.body)); return }
+    const meta: Meta = JSON.parse(row.meta), service = this.workspace(), acct = await service.account()
+    if (!acct || acct.id !== meta.profile) throw new Error('请先连接草稿所属的钉钉账号。')
+    const changed = this.db.prepare("UPDATE assistant_card SET state='sending' WHERE id=? AND state='draft' AND body=?").run(row.id,cmd.previous)
+    if (!changed.changes) throw new Error('草稿已处理或修改。')
+    try {
+      const receipt = await service.send(acct.id,meta.group!.id,row.body,row.id)
+      this.bind(row.id,acct,row.target,{...meta,receipt})
+      this.update(row.id,'done','群消息已发送',row.body)
+    }
+    catch { this.update(row.id,'unknown','发送结果待核对',row.body) }
+  }
+  async tick() {
+    if (this.polling || this.closing) return
+    this.polling = true
+    try { await this.tracked(async () => {
+      const watches = this.rows("SELECT * FROM assistant_card WHERE state='watching'")
+      if (!watches.length) return
+      let service: Workspace, acct: Identity | null
+      try { service = this.workspace(); acct = await service.account() }
+      catch (e) {
+        this.db.prepare("UPDATE assistant_card SET body=? WHERE state='watching'").run(problem(e))
+        return
+      }
+      for (const row of watches) {
+        const meta: Meta = JSON.parse(row.meta)
+        try {
+          if (!acct || acct.id !== meta.profile) throw new Error('等待原钉钉账号重新连接。')
+          const until = meta.until || new Date(Math.min(Date.now(),Date.parse(meta.since!) + 86_400_000)).toISOString()
+          if (until <= meta.since!) continue
+          const page = await service.replies(acct.id,meta.group!.id,meta.person!.id,meta.since!,until,meta.token || '')
+          if (this.row(row.room,row.id).state !== 'watching') continue
+          this.db.exec('BEGIN IMMEDIATE')
+          try {
+            for (const m of page.messages) {
+              const id = createHash('sha256').update(JSON.stringify([row.room,acct.id,meta.group!.id,m.id])).digest('hex')
+              if (!this.rows('SELECT id FROM assistant_card WHERE id=?',id).length) {
+                this.add(id,row.room,meta.person!.name,'incoming','done','钉钉同事 · '+meta.group!.name,m.text)
+              }
+            }
+            this.bind(row.id,acct,row.target,{...meta,since:page.next ? meta.since! : until,until:page.next ? until : '',token:page.next})
+            this.db.prepare("UPDATE assistant_card SET body='新消息会出现在这个会话。' WHERE id=?").run(row.id)
+            this.db.exec('COMMIT')
+          } catch (e) { this.db.exec('ROLLBACK'); throw e }
+        } catch (e) { this.db.prepare("UPDATE assistant_card SET body=? WHERE id=? AND state='watching'").run(problem(e),row.id) }
+      }
+    }) } finally { this.polling = false }
+  }
+}

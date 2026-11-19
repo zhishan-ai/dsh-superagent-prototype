@@ -1,0 +1,79 @@
+.sa-assistant{
+  --desk-bg:var(--dsw-alias-bg-base,Canvas);
+  --desk-ink:var(--dsw-alias-label-primary,CanvasText);
+  --desk-muted:var(--dsw-alias-label-secondary,GrayText);
+  --desk-rail:var(--dsw-specific-sidebar-fill,var(--desk-bg));
+  --desk-surface:color-mix(in srgb,var(--desk-ink) 5%,var(--desk-bg));
+  --desk-selected:color-mix(in srgb,var(--desk-ink) 9%,var(--desk-bg));
+  --desk-line:var(--dsw-alias-border-l3,color-mix(in srgb,var(--desk-ink) 16%,var(--desk-bg)));
+  --desk-focus:var(--dsw-alias-label-primary,Highlight);
+}
+/* One ink shape and two eyes per partner, drawn in a square optical box. */
+.sa-assistant .peb{--d:26px;--skin:light-dark(#cac9bf,#faf9f4);--lx:53%;--ly:41%;--rx:74%;--ry:36%;--lh:22%;--rh:27%;--lean:7deg;display:inline-block;position:relative;width:var(--d);height:var(--d);flex:none;vertical-align:middle;background:var(--skin);border-radius:57% 43% 48% 52% / 64% 57% 43% 36%;clip-path:shape(from 5% 59%,curve to 40% 14% with 7% 42% / 24% 15%,curve to 69% 9% with 54% 13% / 59% 3%,curve to 92% 39% with 83% 10% / 86% 27%,curve to 83% 79% with 101% 53% / 98% 68%,curve to 39% 94% with 71% 90% / 55% 97%,curve to 5% 59% with 12% 94% / 0% 79%,close);transform-origin:50% 85%}
+.sa-assistant .peb:before,.sa-assistant .peb:after{content:"";position:absolute;width:11%;height:var(--lh);left:var(--lx);top:var(--ly);border-radius:100px;background:#151414;rotate:var(--lean);transform-origin:center}
+.sa-assistant .peb:after{height:var(--rh);left:var(--rx);top:var(--ry)}
+.sa-assistant .peb.violet{--skin:#9866ff;--lx:24%;--ly:27%;--rx:46%;--ry:21%;--lh:18%;--rh:29%;--lean:-28deg;border-radius:46% 54% 55% 45% / 45% 60% 40% 55%;clip-path:shape(from 9% 45%,curve to 24% 14% with 3% 30% / 11% 17%,curve to 43% 15% with 32% 11% / 35% 18%,curve to 64% 14% with 50% 13% / 56% 9%,curve to 82% 37% with 73% 19% / 75% 29%,curve to 96% 63% with 89% 46% / 101% 52%,curve to 78% 85% with 95% 72% / 89% 79%,curve to 37% 94% with 65% 93% / 48% 97%,curve to 17% 75% with 27% 92% / 22% 86%,curve to 9% 45% with 12% 65% / 13% 55%,close)}
+.sa-assistant .peb.teal{--skin:#23bdab;--lx:34%;--ly:39%;--rx:55%;--ry:43%;--lh:15%;--rh:22%;--lean:-8deg;border-radius:37% 43% 31% 39%;clip-path:shape(from 6% 48%,curve to 23% 28% with 2% 37% / 9% 27%,curve to 53% 17% with 20% 9% / 40% 3%,curve to 77% 27% with 68% 6% / 79% 13%,curve to 89% 51% with 95% 23% / 100% 40%,curve to 76% 78% with 102% 66% / 92% 80%,curve to 45% 86% with 72% 97% / 55% 98%,curve to 20% 76% with 32% 96% / 18% 91%,curve to 6% 48% with 0% 77% / -1% 59%,close)}
+.sa-assistant .peb.sun{--skin:#f8bf54;--lx:29%;--ly:42%;--rx:54%;--ry:36%;--lh:19%;--rh:25%;--lean:12deg;border-radius:62% 37% 35% 30%;clip-path:shape(from 6% 66%,curve to 43% 20% with 12% 52% / 27% 24%,curve to 68% 15% with 53% 13% / 57% 9%,curve to 91% 62% with 78% 20% / 86% 46%,curve to 75% 88% with 98% 79% / 87% 90%,line to 24% 90%,curve to 6% 66% with 6% 91% / -2% 82%,close)}
+@supports (clip-path:shape(from 0% 0%,line to 100% 0%,line to 0% 100%,close)){.sa-assistant .peb:not(.person){border-radius:0}}
+.sa-assistant .peb.person{background:#bebf9c;clip-path:none;border-radius:50%;overflow:hidden}
+.sa-assistant .person:before{width:49%;height:62%;top:51%;left:25%;border-radius:44% 44% 0 0;background:#304934;rotate:none}
+.sa-assistant .person:after{width:32%;height:39%;top:22%;left:34%;background:#364e3a;border-radius:50%;rotate:none}
+@keyframes pa-look-up{0%,100%{transform:none}38%{transform:translateY(-4%) rotate(7deg)}72%{transform:rotate(-2deg)}}
+@keyframes pa-lilt{0%,100%{transform:none}24%{transform:rotate(-9deg) scale(1.04,.94)}56%{transform:translateY(-7%) rotate(3deg)}}
+@keyframes pa-squish{0%,100%{transform:none}36%{transform:scale(1.09,.88)}67%{transform:scale(.96,1.04)}}
+@keyframes pa-blink{0%,44%,72%,100%{scale:1}58%{scale:1 .18}}
+@media(prefers-reduced-motion:no-preference){
+ .sa-assistant .peb{--gesture:pa-look-up}
+ .sa-assistant .peb.violet{--gesture:pa-lilt}
+ .sa-assistant .peb.teal,.sa-assistant .peb.sun{--gesture:pa-squish}
+ .sa-assistant .pin:focus-visible .peb,.sa-assistant .peb.greet{animation:var(--gesture) 480ms ease-out}
+ .sa-assistant .peb.greet:before,.sa-assistant .peb.greet:after{animation:pa-blink 460ms ease-out}
+ @media(hover:hover){.sa-assistant .pin:hover .peb{animation:var(--gesture) 480ms ease-out}
+ .sa-assistant .pin:hover .peb:before,.sa-assistant .pin:hover .peb:after{translate:calc(var(--d) * .025) -1px}}
+}
+.sa-assistant{container-type:inline-size;display:flex;width:100%;height:100%;min-height:0;min-width:0;overflow:hidden;background:var(--desk-bg);color:var(--desk-ink);font:15px/1.55 system-ui,sans-serif}
+.sa-assistant *{box-sizing:border-box}
+.sa-assistant button,.sa-assistant textarea{font:inherit;color:inherit}
+.sa-assistant button{border:0;background:none;cursor:pointer;border-radius:14px;padding:7px 12px}
+.sa-assistant button:hover{background:var(--desk-selected)}
+.sa-assistant button:focus-visible,.sa-assistant textarea:focus-visible{outline:2px solid var(--desk-focus);outline-offset:2px}
+.sa-assistant button:disabled{opacity:.5;cursor:wait}
+.sa-assistant aside{background:var(--desk-rail);flex:0 0 clamp(188px,25%,360px);border-right:1px solid var(--desk-line);padding:22px 14px 12px;display:flex;flex-direction:column;gap:16px}
+.sa-assistant .pins{display:flex;flex-wrap:wrap;gap:2px}
+.sa-assistant .pin{display:grid;justify-items:center;gap:4px;padding:6px}
+.sa-assistant .pin .peb{--d:clamp(44px,4.8cqw,76px)}
+.sa-assistant .small{color:var(--desk-muted);font-size:13px}
+.sa-assistant .group{display:flex;align-items:center;gap:12px;text-align:left}
+.sa-assistant [aria-current=true]{background:var(--desk-selected)}
+.sa-assistant .space{margin-top:auto;display:grid;justify-items:start}
+.sa-assistant main{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0;position:relative}
+.sa-assistant header{height:62px;display:flex;align-items:center;justify-content:center;flex:none}
+.sa-assistant .pill{display:inline-flex;align-items:center;gap:9px;border-radius:24px;border:1px solid var(--desk-line);background:var(--desk-surface);padding:6px 13px}
+.sa-assistant .stack{display:inline-flex;align-items:center}.sa-assistant .stack .peb{--d:22px;margin-left:-5px}
+.sa-assistant .scroll{overflow:auto;flex:1;min-height:0;padding:16px clamp(12px,2.5cqw,38px)}
+.sa-assistant .empty{height:100%;display:grid;align-content:center;justify-items:center;gap:14px;color:var(--desk-muted)}
+.sa-assistant .empty .peb{--d:60px}
+.sa-assistant article{display:flex;align-items:flex-end;gap:9px;margin:14px 0}
+.sa-assistant article .copy{min-width:0;max-width:min(86%,760px)}
+.sa-assistant .bubble{background:var(--desk-surface);border-radius:18px;padding:10px 16px;font-size:clamp(15px,1.4cqw,20px);white-space:pre-wrap;overflow-wrap:anywhere}
+.sa-assistant .bubble p{margin:4px 0}
+.sa-assistant .mine{justify-content:flex-end}
+.sa-assistant .mine .bubble{background:var(--desk-selected)}
+.sa-assistant .human{width:28px;height:28px;background:color-mix(in srgb,#427183 27%,var(--desk-bg));border-radius:8px;display:grid;place-content:center}
+.sa-assistant .draft-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.sa-assistant .draft-actions button,.sa-assistant .tools button{border:1px solid var(--desk-line);font-size:14px}
+.sa-assistant .draft-actions button:first-child{background:var(--desk-ink);color:var(--desk-bg)}
+.sa-assistant .composer{display:flex;align-items:center;border:1px solid var(--desk-line);border-radius:30px;background:var(--desk-surface);margin:8px 14px 14px;padding:5px 8px;gap:8px}
+.sa-assistant textarea{background:transparent;border:none;resize:vertical;min-width:0;flex:1;padding:6px;max-height:180px}
+.sa-assistant .bubble textarea{display:block;width:100%;background:var(--desk-bg);border-radius:8px}
+.sa-assistant .composer button:last-child{background:var(--desk-ink);color:var(--desk-bg);border-radius:50%;height:34px;width:34px;padding:0}
+.sa-assistant .tools,.sa-assistant .notice{padding:6px 18px;display:flex;gap:6px;flex-wrap:wrap}
+.sa-assistant .notice{color:var(--dsw-alias-state-warn-primary,var(--desk-ink))}
+.sa-assistant .back{display:none}
+@container(max-width:650px){.sa-assistant aside{display:none}.sa-assistant .back{display:block;position:absolute;left:5px}.sa-assistant[data-list=true] aside{display:flex;flex:1}.sa-assistant[data-list=true] main{display:none}}
+.sa-assistant .composer textarea{resize:none}
+.sa-assistant .copy[data-bot=violet]>.small{color:color-mix(in srgb,#9559e8 48%,var(--desk-ink))}
+.sa-assistant .copy[data-bot=teal]>.small{color:color-mix(in srgb,#13a992 48%,var(--desk-ink))}
+.sa-assistant details{cursor:auto}
+.sa-assistant summary{cursor:pointer;color:var(--desk-muted);font-size:14px}
