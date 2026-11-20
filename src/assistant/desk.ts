@@ -456,9 +456,22 @@ export class AssistantDesk {
     finally { this.busy.delete(row.room) }
   }
   private history(row: Row) {
-    const previous = this.db.prepare(`SELECT author, title, substr(body, 1, 1400) AS excerpt FROM assistant_card
+    const previous = this.db.prepare(`WITH recent_cards AS (
+      SELECT id, room, rowid AS seq, author, title, body FROM assistant_card
       WHERE room=? AND kind<>'incoming' AND rowid<(SELECT rowid FROM assistant_card WHERE id=?)
-      ORDER BY rowid DESC LIMIT 16`).all(row.room, row.id)
+      ORDER BY rowid DESC LIMIT 16
+    ), history_entries AS (
+      SELECT seq, 0 AS step_seq, author, title, body FROM recent_cards
+      UNION ALL
+      SELECT card.seq, step.rowid, step.partner, '已完成分工《' || work.title || '》 · ' || step.title, step.output
+      FROM recent_cards AS card
+      JOIN assistant_group_work AS work ON work.id=card.id AND work.room=card.room
+      JOIN assistant_group_work_step AS step ON step.work_id=work.id
+      WHERE NOT EXISTS (SELECT 1 FROM assistant_group_work_step AS incomplete
+        WHERE incomplete.work_id=work.id AND incomplete.state<>'done')
+    )
+    SELECT author, title, substr(body, 1, 1400) AS excerpt FROM history_entries
+    ORDER BY seq DESC, step_seq DESC LIMIT 16`).all(row.room, row.id)
     return JSON.stringify(previous.reverse().map(card => [card.author, card.title, card.excerpt]))
   }
   private async runWorkStep(room: string, requestId: string, step: WorkStep, inputs: WorkInput[]) {

@@ -236,6 +236,54 @@ it('routes independent group steps and releases the handoff only after both resu
 
 const workStep = (id: string, bot: string, dependsOn: string[]) => ({ id, bot, dependsOn, title: id, instructions: '完成该步骤' })
 
+it('supplies completed group deliveries to a later mention from the same room', async () => {
+  using db = new DatabaseSync(':memory:')
+  const work = { title: '换书会通知', steps: [workStep('facts', 'white', []), workStep('draft', 'violet', ['facts'])] }
+  const followUp = '@栗子 请将刚交付的通知缩成一句。'
+  const draft = '请到北侧第三柜领取 17 份折页，核对码 QA-714。'
+  const otherOutputs = new Map([
+    ['另一群的分工', '另一群的内部成果'],
+    ['未完成的分工', '还不能作为已交付成果'],
+  ])
+  const plan = vi.fn<Planner>(async (_room, _history, request, context) => {
+    if (request === followUp) return { bot: 'violet', reply: '改写完成。', actions: [] }
+    if (!context.workStep) return { bot: 'white', reply: '', actions: [], work }
+    if (request === '未完成的分工' && context.target === 'violet') throw new Error('模型暂时不可用')
+    const reply = otherOutputs.get(request) ?? (context.target === 'violet' ? draft : '折页共 17 份。')
+    return { bot: context.target!, reply, actions: [] }
+  })
+  const desk = new AssistantDesk(db, () => undefined, plan)
+  const send = (assistant: AssistantDesk, room: string, text: string, mention?: string) =>
+    assistant.execute({ op: 'message', room, id: randomUUID(), text, mention })
+  try {
+    await desk.execute({ op: 'create-group', name: '独立群', members: ['white', 'violet'] })
+    const otherRoom = desk.conversation('team').groups.find(group => group.name === '独立群')!.id
+    await send(desk, otherRoom, '另一群的分工')
+    await send(desk, 'team', '请分工准备换书会通知。')
+    await vi.waitFor(() => expect(desk.conversation('team').work?.[0]?.state).toBe('done'))
+    await send(desk, 'team', '未完成的分工')
+    await vi.waitFor(() => expect(desk.conversation('team').work?.[1]?.state).toBe('failed'))
+    await vi.waitFor(() => expect(desk.conversation(otherRoom).work?.[0]?.state).toBe('done'))
+  } finally {
+    await desk.stop()
+  }
+
+  const reopened = new AssistantDesk(db, () => undefined, plan)
+  try {
+    await send(reopened, 'team', followUp, 'violet')
+    const call = plan.mock.calls.find(([, , request]) => request === followUp)
+    expect(call?.[3].target).toBe('violet')
+    expect(JSON.parse(call![1])).toEqual([
+      ['me', '', '请分工准备换书会通知。'],
+      ['white', '已完成分工《换书会通知》 · facts', '折页共 17 份。'],
+      ['violet', '已完成分工《换书会通知》 · draft', draft],
+      ['me', '', '未完成的分工'],
+    ])
+  } finally {
+    await reopened.stop()
+  }
+})
+
 it('resumes an interrupted group handoff and retries failed steps without rerunning completed work', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-assistant-handoff-'))
   const snapshot = join(directory, 'interrupted.sqlite')
